@@ -1,0 +1,93 @@
+# OS / editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Python caches and local build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.egg-info/
+build/
+dist/
+
+# Local environments
+.env
+.env.*
+.venv/
+venv/
+env/
+ENV/
+
+# Downloaded datasets and image data
+datasets/
+data/
+imageNet_images/
+ImageNet/
+imagenet/
+
+# Model weights and large ML artifacts
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+*.bin
+*.onnx
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# Keep lightweight model/config files under pretrains, ignore downloaded weights.
+pretrains/**
+!pretrains/
+!pretrains/models/
+!pretrains/models/*.yaml
+!pretrains/models/*.yml
+!pretrains/**/.gitkeep
+
+# EEG/raw signal files and archives
+*.mat
+*.fif
+*.edf
+*.bdf
+*.set
+*.cnt
+*.vhdr
+*.vmrk
+*.eeg
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# Training/evaluation outputs
+results/
+outputs/
+output/
+runs/
+logs/
+checkpoints/
+wandb/
+lightning_logs/
+tensorboard/
+samples/
+generated/
+generated_images/
+
+# Local scratch/debug files
+tmp/
+temp/
+debug/
+debug_failed/
