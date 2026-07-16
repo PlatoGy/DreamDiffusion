@@ -86,6 +86,12 @@ def stack_for_prediction(samples, gt_index, pred_index):
     return sample_ids, np.stack(gt_images), np.stack(pred_images)
 
 
+def limit_samples(samples, limit):
+    if limit is None:
+        return samples
+    return dict(list(samples.items())[:limit])
+
+
 def finite_mean(values):
     clean = [value for value in values if not (isinstance(value, float) and math.isnan(value))]
     if not clean:
@@ -124,17 +130,30 @@ def main():
     parser.add_argument("--top-k", type=int, default=1, help="Top-k for n-way classification accuracy.")
     parser.add_argument("--skip-psm", action="store_true", help="Skip LPIPS/PSM pair-wise metric.")
     parser.add_argument("--skip-class", action="store_true", help="Skip author-style 50-way top-1 class metric.")
+    parser.add_argument(
+        "--metrics",
+        default="mse,pcc,ssim",
+        help="Comma-separated pair-wise metrics to run. Choices: mse,pcc,ssim,psm. Default: mse,pcc,ssim.",
+    )
+    parser.add_argument(
+        "--limit-samples",
+        type=int,
+        default=None,
+        help="Evaluate only the first N samples for a quick smoke test.",
+    )
     parser.add_argument("--output-prefix", default="author_eval", help="Output file prefix.")
     args = parser.parse_args()
 
     if not args.run_dir.exists():
         raise FileNotFoundError(args.run_dir)
 
+    print("Importing author eval_metrics.py ...", flush=True)
     import eval_metrics as author_eval_metrics
 
     patch_torchmetrics_accuracy(author_eval_metrics)
 
     samples = collect_generated_samples(args.run_dir, args.gt_index)
+    samples = limit_samples(samples, args.limit_samples)
     if not samples:
         raise FileNotFoundError(
             f"No test images found in {args.run_dir}. Expected files like test0-0.png and test0-1.png."
@@ -144,12 +163,22 @@ def main():
     if not prediction_indices:
         raise FileNotFoundError("No generated prediction images found.")
 
-    pairwise_metrics = ["mse", "pcc", "ssim"]
-    if not args.skip_psm:
-        pairwise_metrics.append("psm")
+    pairwise_metrics = [metric.strip() for metric in args.metrics.split(",") if metric.strip()]
+    unknown_metrics = sorted(set(pairwise_metrics) - {"mse", "pcc", "ssim", "psm"})
+    if unknown_metrics:
+        raise ValueError(f"Unknown metrics: {unknown_metrics}. Valid choices are mse,pcc,ssim,psm.")
+    if args.skip_psm:
+        pairwise_metrics = [metric for metric in pairwise_metrics if metric != "psm"]
+
+    print(f"Run dir: {args.run_dir}", flush=True)
+    print(f"Samples with ground truth: {len(samples)}", flush=True)
+    print(f"Prediction indices: {prediction_indices}", flush=True)
+    print(f"Pair-wise metrics: {pairwise_metrics}", flush=True)
+    print(f"Class metric enabled: {not args.skip_class}", flush=True)
 
     rows = []
     for pred_index in prediction_indices:
+        print(f"\nLoading images for prediction index {pred_index} ...", flush=True)
         sample_ids, gt_images, pred_images = stack_for_prediction(samples, args.gt_index, pred_index)
         row = {
             "prediction_index": pred_index,
@@ -157,6 +186,11 @@ def main():
         }
 
         for metric_name in pairwise_metrics:
+            print(
+                f"Computing author pair-wise_{metric_name} for prediction index {pred_index} "
+                f"({len(sample_ids)} samples; this compares each prediction against all other GT images) ...",
+                flush=True,
+            )
             scores = author_eval_metrics.get_similarity_metric(
                 pred_images,
                 gt_images,
@@ -164,8 +198,13 @@ def main():
                 metric_name=metric_name,
             )
             row[f"pair-wise_{metric_name}"] = finite_mean(scores)
+            print(f"Finished pair-wise_{metric_name}: {row[f'pair-wise_{metric_name}']:.6f}", flush=True)
 
         if not args.skip_class:
+            print(
+                f"Computing author {args.n_way}-way top-{args.top_k} class metric for prediction index {pred_index} ...",
+                flush=True,
+            )
             scores = author_eval_metrics.get_similarity_metric(
                 pred_images,
                 gt_images,
@@ -177,6 +216,7 @@ def main():
                 device=args.device,
             )
             row[f"top-{args.top_k}-class"] = finite_mean(scores)
+            print(f"Finished top-{args.top_k}-class: {row[f'top-{args.top_k}-class']:.6f}", flush=True)
 
         rows.append(row)
 
