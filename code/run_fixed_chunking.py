@@ -53,11 +53,11 @@ def parse_args():
     parser.add_argument("--eps", type=float, default=1e-8)
     parser.add_argument(
         "--time-token-policy",
-        choices=["auto", "preserve"],
+        choices=["auto", "post_projector", "preserve"],
         default="auto",
         help=(
-            "auto preserves time tokens for uniform/forward because the original channel_mapper mixes "
-            "EEG time tokens before cross-attention. baseline keeps the original model."
+            "auto/post_projector applies routing to the original 77-token U-Net conditioning sequence. "
+            "preserve is kept only for documentation and is not supported by the official checkpoint."
         ),
     )
     return parser.parse_args()
@@ -240,6 +240,13 @@ def patch_cond_stage_for_time_tokens(cond_stage, routing_state):
 
     cond_stage.forward = forward_time_preserving
     return original_forward
+
+
+def record_original_conditioner_shapes(cond_stage, conditioning, re_latent, routing_state):
+    routing_state.debug_shapes.setdefault("eeg_encoder_return_shape", list(re_latent.shape))
+    routing_state.debug_shapes.setdefault("cross_attention_context_shape", list(conditioning.shape))
+    routing_state.debug_shapes.setdefault("conditioner_global_pool", bool(getattr(cond_stage, "global_pool", False)))
+    routing_state.debug_shapes.setdefault("conditioner_has_channel_mapper", hasattr(cond_stage, "channel_mapper"))
 
 
 @contextlib.contextmanager
@@ -453,9 +460,13 @@ def save_image_grid_and_samples(generative_model, dataset, config, args, routing
             latent = item["eeg"]
             gt_image = rearrange(item["image"], "h w c -> 1 c h w")
             print(f"rendering sample {count}, {config.num_samples} examples in {config.ddim_steps} steps.", flush=True)
-            c, _ = model.get_learned_conditioning(
+            c, re_latent = model.get_learned_conditioning(
                 repeat(latent, "h w -> c h w", c=config.num_samples).to(generative_model.device)
             )
+            if routing_state.enabled:
+                record_original_conditioner_shapes(model.cond_stage_model, c, re_latent, routing_state)
+                if routing_state.token_count is None:
+                    routing_state.set_token_count(c.shape[1], c.device, c.dtype)
             routing_state.conditional_batch = c.shape[0]
             if args.debug_shapes:
                 routing_state.debug_shapes.setdefault("actual_unet_context_shape", list(c.shape))
@@ -522,9 +533,9 @@ def write_metadata(path, args, routing_state, config, generated_count, paths):
         "routing_stats": routing_state.token_prior_stats(),
         "cfg_handling": routing_state.cfg_mode,
         "notes": (
-            "Original DreamDiffusion maps ordered EEG encoder tokens through channel_mapper before U-Net cross-attention. "
-            "For uniform/forward, this script preserves ordered EEG encoder tokens and projects them with dim_mapper, "
-            "so chunk bias is applied to time-ordered EEG tokens at U-Net cross-attention."
+            "The official DreamDiffusion checkpoint maps EEG encoder outputs through channel_mapper/dim_mapper before "
+            "U-Net cross-attention. To stay checkpoint-compatible, uniform/forward leave the conditioner unchanged and "
+            "apply routing bias to the post-projector U-Net context tokens. These chunks are not raw EEG time chunks."
         ),
     }
     path.write_text(json.dumps(metadata, indent=2))
@@ -567,10 +578,17 @@ def main():
 
     original_cond_forward = None
     if args.routing_mode != "baseline":
-        if getattr(model.model.cond_stage_model, "global_pool", False):
-            raise RuntimeError("global_pool=True removes time token sequence; fixed chunk routing needs token sequence.")
-        original_cond_forward = patch_cond_stage_for_time_tokens(model.model.cond_stage_model, routing_state)
-        print("patched cond_stage_model to preserve ordered EEG encoder tokens for cross-attention.", flush=True)
+        if args.time_token_policy == "preserve":
+            raise RuntimeError(
+                "--time-token-policy preserve is incompatible with the official checkpoint: "
+                "the U-Net was trained to receive the original post-projector conditioning tokens, "
+                "not raw EEG encoder tokens."
+            )
+        print(
+            "routing mode: original conditioner is unchanged; routing is applied to post-projector "
+            "U-Net context tokens.",
+            flush=True,
+        )
     else:
         print("baseline mode: original attention and original conditioner are unchanged.", flush=True)
 
