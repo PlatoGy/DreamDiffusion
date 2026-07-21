@@ -31,7 +31,11 @@ def parse_args():
         description="Fixed EEG chunk routing experiments for DreamDiffusion inference."
     )
     parser.add_argument("--stage", choices=["sample", "train"], default="sample")
-    parser.add_argument("--routing-mode", choices=["baseline", "uniform", "forward"], default="baseline")
+    parser.add_argument(
+        "--routing-mode",
+        choices=["baseline", "uniform", "forward", "reverse", "constant1", "constant2", "constant3"],
+        default="baseline",
+    )
     parser.add_argument("--root", type=Path, default=Path("."))
     parser.add_argument("--dataset", type=str, default="EEG")
     parser.add_argument("--model_path", "--checkpoint", dest="model_path", type=Path, required=False,
@@ -114,18 +118,62 @@ def validate_chunks(num_tokens, bounds):
         raise AssertionError(f"Chunk lengths differ by more than 1: {lengths}")
 
 
+def get_chunk_weights(routing_mode, progress, device=None, dtype=None):
+    import torch
+
+    if routing_mode == "baseline":
+        return None
+
+    if torch.is_tensor(progress):
+        progress_tensor = progress.to(device=device or progress.device, dtype=torch.float32)
+        scalar_input = progress_tensor.ndim == 0
+    else:
+        progress_tensor = torch.tensor(progress, device=device, dtype=torch.float32)
+        scalar_input = True
+
+    progress_flat = progress_tensor.reshape(-1)
+    weights = torch.empty((progress_flat.shape[0], 3), device=progress_flat.device, dtype=torch.float32)
+
+    if routing_mode == "uniform":
+        weights[:] = torch.tensor([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], device=weights.device)
+    elif routing_mode == "forward":
+        early = progress_flat < (1.0 / 3.0)
+        middle = (progress_flat >= (1.0 / 3.0)) & (progress_flat < (2.0 / 3.0))
+        late = progress_flat >= (2.0 / 3.0)
+        weights[early] = torch.tensor([0.8, 0.1, 0.1], device=weights.device)
+        weights[middle] = torch.tensor([0.1, 0.8, 0.1], device=weights.device)
+        weights[late] = torch.tensor([0.1, 0.1, 0.8], device=weights.device)
+    elif routing_mode == "reverse":
+        early = progress_flat < (1.0 / 3.0)
+        middle = (progress_flat >= (1.0 / 3.0)) & (progress_flat < (2.0 / 3.0))
+        late = progress_flat >= (2.0 / 3.0)
+        weights[early] = torch.tensor([0.1, 0.1, 0.8], device=weights.device)
+        weights[middle] = torch.tensor([0.1, 0.8, 0.1], device=weights.device)
+        weights[late] = torch.tensor([0.8, 0.1, 0.1], device=weights.device)
+    elif routing_mode == "constant1":
+        weights[:] = torch.tensor([0.8, 0.1, 0.1], device=weights.device)
+    elif routing_mode == "constant2":
+        weights[:] = torch.tensor([0.1, 0.8, 0.1], device=weights.device)
+    elif routing_mode == "constant3":
+        weights[:] = torch.tensor([0.1, 0.1, 0.8], device=weights.device)
+    else:
+        raise ValueError(routing_mode)
+
+    if not torch.allclose(weights.sum(dim=-1), torch.ones(weights.shape[0], device=weights.device), atol=1e-6):
+        raise AssertionError(f"{routing_mode} weights do not sum to 1: {weights}")
+    if torch.any(weights <= 0):
+        raise AssertionError(f"{routing_mode} weights contain non-positive values: {weights}")
+    if torch.isnan(weights).any() or torch.isinf(weights).any():
+        raise AssertionError(f"{routing_mode} weights contain NaN or Inf: {weights}")
+
+    weights = weights.to(dtype=dtype or torch.float32)
+    return weights[0] if scalar_input else weights.reshape(*progress_tensor.shape, 3)
+
+
 def stage_weights(mode, progress):
     if mode == "baseline":
         return None
-    if mode == "uniform":
-        return [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]
-    if mode == "forward":
-        if progress < 1.0 / 3.0:
-            return [0.8, 0.1, 0.1]
-        if progress < 2.0 / 3.0:
-            return [0.1, 0.8, 0.1]
-        return [0.1, 0.1, 0.8]
-    raise ValueError(mode)
+    return get_chunk_weights(mode, progress).detach().cpu().tolist()
 
 
 def validate_stage_weights():
@@ -134,18 +182,76 @@ def validate_stage_weights():
         "forward@early": stage_weights("forward", 0.0),
         "forward@middle": stage_weights("forward", 0.5),
         "forward@late": stage_weights("forward", 1.0),
+        "forward@one_third": stage_weights("forward", 1.0 / 3.0),
+        "forward@two_thirds": stage_weights("forward", 2.0 / 3.0),
+        "reverse@early": stage_weights("reverse", 0.1),
+        "reverse@middle": stage_weights("reverse", 0.5),
+        "reverse@late": stage_weights("reverse", 0.9),
+        "constant1@early": stage_weights("constant1", 0.1),
+        "constant1@middle": stage_weights("constant1", 0.5),
+        "constant1@late": stage_weights("constant1", 0.9),
+        "constant2@early": stage_weights("constant2", 0.1),
+        "constant2@middle": stage_weights("constant2", 0.5),
+        "constant2@late": stage_weights("constant2", 0.9),
+        "constant3@early": stage_weights("constant3", 0.1),
+        "constant3@middle": stage_weights("constant3", 0.5),
+        "constant3@late": stage_weights("constant3", 0.9),
     }
     expected = {
         "uniform@0": [1.0 / 3.0] * 3,
         "forward@early": [0.8, 0.1, 0.1],
         "forward@middle": [0.1, 0.8, 0.1],
         "forward@late": [0.1, 0.1, 0.8],
+        "forward@one_third": [0.1, 0.8, 0.1],
+        "forward@two_thirds": [0.1, 0.1, 0.8],
+        "reverse@early": [0.1, 0.1, 0.8],
+        "reverse@middle": [0.1, 0.8, 0.1],
+        "reverse@late": [0.8, 0.1, 0.1],
+        "constant1@early": [0.8, 0.1, 0.1],
+        "constant1@middle": [0.8, 0.1, 0.1],
+        "constant1@late": [0.8, 0.1, 0.1],
+        "constant2@early": [0.1, 0.8, 0.1],
+        "constant2@middle": [0.1, 0.8, 0.1],
+        "constant2@late": [0.1, 0.8, 0.1],
+        "constant3@early": [0.1, 0.1, 0.8],
+        "constant3@middle": [0.1, 0.1, 0.8],
+        "constant3@late": [0.1, 0.1, 0.8],
     }
     for key, weights in checks.items():
         if not np.allclose(weights, expected[key]):
             raise AssertionError(f"{key} got {weights}, expected {expected[key]}")
         if not math.isclose(sum(weights), 1.0, rel_tol=1e-6, abs_tol=1e-6):
             raise AssertionError(f"{key} weights do not sum to 1: {weights}")
+    return checks
+
+
+def validate_token_prior():
+    import torch
+
+    bounds = chunk_boundaries(77, 3)
+    validate_chunks(77, bounds)
+    membership = membership_matrix(77, bounds, device="cpu", dtype=torch.float32)
+    checks = {}
+    for mode in ["uniform", "forward", "reverse", "constant1", "constant2", "constant3"]:
+        for progress in [0.0, 0.1, 0.5, 0.9, 1.0]:
+            weights = get_chunk_weights(mode, progress, device=torch.device("cpu"), dtype=torch.float32)
+            pi = weights @ membership
+            bias = torch.log(pi + 1e-8)
+            if torch.any(pi <= 0):
+                raise AssertionError(f"{mode}@{progress} token prior has non-positive values.")
+            if torch.isnan(bias).any() or torch.isinf(bias).any():
+                raise AssertionError(f"{mode}@{progress} log-bias contains NaN or Inf.")
+            checks[f"{mode}@{progress}"] = {
+                "pi_min": float(pi.min().item()),
+                "pi_max": float(pi.max().item()),
+            }
+
+    batch_progress = torch.tensor([0.1, 0.5, 0.9])
+    batch_weights = get_chunk_weights("reverse", batch_progress)
+    if tuple(batch_weights.shape) != (3, 3):
+        raise AssertionError(f"batched progress returned wrong shape: {tuple(batch_weights.shape)}")
+    if not torch.allclose(batch_weights.sum(dim=-1), torch.ones(3), atol=1e-6):
+        raise AssertionError("batched reverse weights do not sum to 1.")
     return checks
 
 
@@ -176,6 +282,8 @@ class RoutingState:
         self.conditional_batch = None
         self.debug_shapes = {}
         self.printed_attention_debug = False
+        self.first_progress = None
+        self.last_progress = None
         self.cfg_mode = "no CFG detected in this script unless sampler receives unconditional_conditioning"
 
     def set_token_count(self, token_count, device, dtype):
@@ -190,6 +298,9 @@ class RoutingState:
     def update_progress(self, step_index, total_steps, device=None, dtype=None):
         self.total_steps = int(total_steps)
         self.progress = 0.0 if total_steps <= 1 else float(step_index) / float(total_steps - 1)
+        if self.first_progress is None:
+            self.first_progress = self.progress
+        self.last_progress = self.progress
         if self.membership is not None:
             self.update_bias(device=device or self.membership.device, dtype=dtype or self.membership.dtype)
 
@@ -199,8 +310,8 @@ class RoutingState:
         if not self.enabled or self.membership is None:
             self.bias = None
             return
-        weights = torch.tensor(stage_weights(self.mode, self.progress), device=device, dtype=torch.float32)
-        if not torch.isclose(weights.sum(), torch.tensor(1.0, device=device), atol=1e-6):
+        weights = get_chunk_weights(self.mode, self.progress, device=device, dtype=torch.float32)
+        if not torch.allclose(weights.sum(dim=-1), torch.ones_like(weights.sum(dim=-1)), atol=1e-6):
             raise AssertionError(f"stage weights do not sum to 1: {weights.detach().cpu().tolist()}")
         pi = weights @ self.membership.to(device=device)
         if torch.any(pi <= 0):
@@ -220,6 +331,12 @@ class RoutingState:
             "bias_shape": list(self.bias.shape),
             "progress": self.progress,
             "weights": stage_weights(self.mode, self.progress),
+        }
+
+    def progress_stats(self):
+        return {
+            "first_sampler_progress": self.first_progress,
+            "last_sampler_progress": self.last_progress,
         }
 
 
@@ -249,6 +366,22 @@ def record_original_conditioner_shapes(cond_stage, conditioning, re_latent, rout
     routing_state.debug_shapes.setdefault("conditioner_has_channel_mapper", hasattr(cond_stage, "channel_mapper"))
 
 
+def routing_weight_summary(mode):
+    if mode == "baseline":
+        return None
+    return {
+        "early": stage_weights(mode, 0.1),
+        "middle": stage_weights(mode, 0.5),
+        "late": stage_weights(mode, 0.9),
+    }
+
+
+def constant_chunk(mode):
+    if mode.startswith("constant"):
+        return int(mode.replace("constant", ""))
+    return None
+
+
 @contextlib.contextmanager
 def patch_cross_attention(routing_state, debug_shapes=False):
     import torch
@@ -270,16 +403,32 @@ def patch_cross_attention(routing_state, debug_shapes=False):
         if routing_state.enabled and is_cross:
             if routing_state.bias is None:
                 raise RuntimeError("Routing bias is not initialized.")
-            if sim.shape[-1] != routing_state.bias.shape[0]:
+            if sim.shape[-1] != routing_state.bias.shape[-1]:
                 raise RuntimeError(
                     f"Cross-attention context length {sim.shape[-1]} does not match routing token count "
-                    f"{routing_state.bias.shape[0]}. This usually means the original projector changed token length."
+                    f"{routing_state.bias.shape[-1]}. This usually means the original projector changed token length."
                 )
-            bias = routing_state.bias.to(device=sim.device, dtype=sim.dtype).view(1, 1, -1)
             batch_heads = sim.shape[0]
+            bias_value = routing_state.bias.to(device=sim.device, dtype=sim.dtype)
+            if bias_value.ndim == 1:
+                bias = bias_value.view(1, 1, -1)
+                conditional_bias = bias
+            elif bias_value.ndim == 2:
+                if routing_state.conditional_batch is None:
+                    raise RuntimeError("Batch routing bias requires routing_state.conditional_batch.")
+                if bias_value.shape[0] != routing_state.conditional_batch:
+                    raise RuntimeError(
+                        f"Batch routing bias has batch {bias_value.shape[0]}, "
+                        f"but conditional batch is {routing_state.conditional_batch}."
+                    )
+                bias = repeat(bias_value, "b n -> (b h) 1 n", h=h)
+                conditional_bias = bias
+            else:
+                raise RuntimeError(f"Routing bias must be 1D or 2D, got shape {list(bias_value.shape)}.")
+
             if routing_state.conditional_batch is not None and batch_heads == routing_state.conditional_batch * h * 2:
                 bias_full = torch.zeros_like(sim[:, :1, :])
-                bias_full[routing_state.conditional_batch * h:] = bias
+                bias_full[routing_state.conditional_batch * h:] = conditional_bias
                 sim = sim + bias_full
                 routing_state.cfg_mode = "detected [unconditional; conditional] concatenation, applied bias only to conditional branch"
             else:
@@ -514,28 +663,38 @@ def write_metadata(path, args, routing_state, config, generated_count, paths):
         "time_token_policy": args.time_token_policy,
         "chunk_boundaries": routing_state.bounds,
         "chunk_lengths": [end - start for start, end in routing_state.bounds] if routing_state.bounds else None,
-        "stage_weights": {
-            "uniform": [1.0 / 3.0] * 3,
-            "forward_early": [0.8, 0.1, 0.1],
-            "forward_middle": [0.1, 0.8, 0.1],
-            "forward_late": [0.1, 0.1, 0.8],
+        "stage_weights": routing_weight_summary(args.routing_mode),
+        "all_mode_stage_weights": {
+            "uniform": routing_weight_summary("uniform"),
+            "forward": routing_weight_summary("forward"),
+            "reverse": routing_weight_summary("reverse"),
+            "constant1": routing_weight_summary("constant1"),
+            "constant2": routing_weight_summary("constant2"),
+            "constant3": routing_weight_summary("constant3"),
         },
+        "constant_chunk": constant_chunk(args.routing_mode),
         "seed": args.seed,
         "checkpoint_path": paths["checkpoint_path"],
+        "checkpoint": paths["checkpoint_path"],
         "config_path": paths["config_path"],
+        "config": paths["config_path"],
         "sampling_steps": config.ddim_steps,
         "sampler_name": "PLMS",
+        "sampler": "PLMS",
         "dataset_split": paths["splits_path"],
         "number_of_generated_samples": generated_count,
+        "number_of_samples": generated_count,
         "num_samples_per_eeg": config.num_samples,
         "git_commit_hash": git_commit(args.root.resolve()),
         "debug_shapes": routing_state.debug_shapes,
         "routing_stats": routing_state.token_prior_stats(),
+        "progress_stats": routing_state.progress_stats(),
         "cfg_handling": routing_state.cfg_mode,
         "notes": (
             "The official DreamDiffusion checkpoint maps EEG encoder outputs through channel_mapper/dim_mapper before "
-            "U-Net cross-attention. To stay checkpoint-compatible, uniform/forward leave the conditioner unchanged and "
-            "apply routing bias to the post-projector U-Net context tokens. These chunks are not raw EEG time chunks."
+            "U-Net cross-attention. To stay checkpoint-compatible, non-baseline routing modes leave the conditioner "
+            "unchanged and apply routing bias to the post-projector U-Net context tokens. These chunks are not raw EEG "
+            "time chunks."
         ),
     }
     path.write_text(json.dumps(metadata, indent=2))
@@ -544,6 +703,7 @@ def write_metadata(path, args, routing_state, config, generated_count, paths):
 def run_tests():
     err = uniform_equivalence_test()
     weights = validate_stage_weights()
+    prior_checks = validate_token_prior()
     bounds = chunk_boundaries(110, 3)
     validate_chunks(110, bounds)
     if bounds != [(0, 37), (37, 74), (74, 110)]:
@@ -552,6 +712,7 @@ def run_tests():
     if err >= 1e-5:
         raise AssertionError(f"uniform equivalence error too high: {err}")
     print(f"forward weights test: {weights}", flush=True)
+    print(f"token prior tests: {prior_checks}", flush=True)
     print(f"N=110 chunk boundaries: {bounds}", flush=True)
 
 
@@ -574,6 +735,11 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     routing_state = RoutingState(args.routing_mode, args.eps)
+    print(f"routing mode: {args.routing_mode}", flush=True)
+    if args.routing_mode != "baseline":
+        print(f"early weights: {stage_weights(args.routing_mode, 0.1)}", flush=True)
+        print(f"middle weights: {stage_weights(args.routing_mode, 0.5)}", flush=True)
+        print(f"late weights: {stage_weights(args.routing_mode, 0.9)}", flush=True)
     model, dataset_test, config, state, paths = build_model_and_data(args, routing_state)
 
     original_cond_forward = None
@@ -606,6 +772,8 @@ def main():
         print(f"EEG token count N: {routing_state.token_count}", flush=True)
         print(f"chunk boundaries: {routing_state.bounds}", flush=True)
         print(f"chunk lengths: {[e - s for s, e in routing_state.bounds]}", flush=True)
+        print(f"first sampler progress: {routing_state.first_progress}", flush=True)
+        print(f"last sampler progress: {routing_state.last_progress}", flush=True)
         print(f"routing stats: {routing_state.token_prior_stats()}", flush=True)
     print(f"CFG handling: {routing_state.cfg_mode}", flush=True)
     print(f"metadata: {output_dir / 'metadata.json'}", flush=True)
