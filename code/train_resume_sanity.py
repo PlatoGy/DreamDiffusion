@@ -136,6 +136,21 @@ def prepare_config(args, checkpoint_payload):
     config.splits_path = str(resolve_path(root, args.splits_path) if args.splits_path else root / "datasets/block_splits_by_image_single.pth")
     config.pretrain_gm_path = str(resolve_path(root, args.pretrain_root) if args.pretrain_root else root / "pretrains")
 
+    defaults = {
+        "clip_tune": True,
+        "cls_tune": False,
+        "eval_avg": True,
+        "global_pool": False,
+        "use_time_cond": True,
+        "crop_ratio": 0.2,
+        "img_size": 512,
+        "ddim_steps": 250,
+        "HW": None,
+    }
+    for key, value in defaults.items():
+        if not hasattr(config, key):
+            setattr(config, key, value)
+
     if args.batch_size is not None:
         config.batch_size = args.batch_size
     if args.lr is not None:
