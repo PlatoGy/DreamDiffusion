@@ -49,7 +49,9 @@ def parse_args():
     parser.add_argument("--splits_path", type=Path, default=None)
     parser.add_argument("--imagenet_path", type=Path, default=None)
     parser.add_argument("--pretrain_root", type=Path, default=None,
-                        help="Directory containing models/v1-5-pruned.ckpt and models/config15.yaml.")
+                        help="Directory containing models/config15.yaml.")
+    parser.add_argument("--config_patch", type=Path, default=None,
+                        help="Stable Diffusion config path. Defaults to pretrain_root/models/config15.yaml.")
     parser.add_argument("--output_dir", type=Path, default=Path("checkpoints/sanity_resume"))
     parser.add_argument("--max_steps", type=int, default=20)
     parser.add_argument("--save_every_n_steps", type=int, default=0)
@@ -220,7 +222,7 @@ def main():
     from torch.utils.data import DataLoader
 
     from dataset import create_EEG_dataset
-    from dc_ldm.ldm_for_eeg import eLDM
+    from dc_ldm.ldm_for_eeg import eLDM_eval
 
     device = torch.device(args.device)
 
@@ -241,8 +243,8 @@ def main():
     np.random.seed(config.seed)
 
     pretrain_root = Path(config.pretrain_gm_path)
-    require_file(pretrain_root / "models/config15.yaml", "Stable Diffusion config")
-    require_file(pretrain_root / "models/v1-5-pruned.ckpt", "Stable Diffusion v1.5 checkpoint")
+    config_patch = resolve_path(root, args.config_patch) if args.config_patch else pretrain_root / "models/config15.yaml"
+    require_file(config_patch, "Stable Diffusion config")
     require_file(config.eeg_signals_path, "EEG signals")
     require_file(config.splits_path, "dataset split")
     if args.imagenet_path is not None:
@@ -273,9 +275,11 @@ def main():
     print(f"train samples: {len(dataset_train)}", flush=True)
     num_voxels = dataset_train.data_len
 
-    print("building eLDM from Stable Diffusion v1.5 base ...", flush=True)
-    generative_model = eLDM(
-        None,
+    print(f"config_patch: {config_patch}", flush=True)
+
+    print("building eLDM_eval from config, then loading generation checkpoint ...", flush=True)
+    generative_model = eLDM_eval(
+        str(config_patch),
         num_voxels,
         device=device,
         pretrain_root=str(pretrain_root),
