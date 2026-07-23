@@ -161,7 +161,8 @@ def main(config):
     # resume training if applicable
     if config.checkpoint_path is not None:
         model_meta = torch.load(config.checkpoint_path, map_location='cpu')
-        generative_model.model.load_state_dict(model_meta['model_state_dict'])
+        missing, unexpected = generative_model.model.load_state_dict(model_meta['model_state_dict'], strict=False)
+        print(f'model resumed with strict=False missing={len(missing)} unexpected={len(unexpected)}')
         print('model resumed')
     # finetune the model
     trainer = create_trainer(config.num_epoch, config.precision, config.accumulate_grad, config.logger, check_val_every_n_epoch=2)
