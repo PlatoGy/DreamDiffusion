@@ -114,10 +114,18 @@ def check_batch_devices(batch, device):
     from collections.abc import Mapping
 
     problems = []
+    expected = torch.device(device)
+
+    def is_expected_device(actual):
+        if expected.type != actual.type:
+            return False
+        if expected.type == "cuda" and expected.index is None:
+            return True
+        return expected.index == actual.index
 
     def visit(value, path):
         if torch.is_tensor(value):
-            if value.device != device:
+            if not is_expected_device(value.device):
                 problems.append(f"{path}: {value.device}")
             return
         if isinstance(value, Mapping):
