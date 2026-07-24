@@ -86,10 +86,13 @@ def resolve_path(root, path):
 
 def move_to_device(value, device):
     import torch
+    from collections.abc import Mapping
 
     if torch.is_tensor(value):
         return value.to(device)
-    if isinstance(value, dict):
+    if hasattr(value, "to") and callable(value.to):
+        return value.to(device)
+    if isinstance(value, Mapping):
         return {key: move_to_device(item, device) for key, item in value.items()}
     if isinstance(value, list):
         return [move_to_device(item, device) for item in value]
@@ -104,6 +107,29 @@ def tensor_to_float(value):
     if torch.is_tensor(value):
         return float(value.detach().cpu())
     return float(value)
+
+
+def check_batch_devices(batch, device):
+    import torch
+    from collections.abc import Mapping
+
+    problems = []
+
+    def visit(value, path):
+        if torch.is_tensor(value):
+            if value.device != device:
+                problems.append(f"{path}: {value.device}")
+            return
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                visit(item, f"{path}.{key}")
+
+    visit(batch, "batch")
+    if problems:
+        raise RuntimeError(
+            "Some batch tensors are not on the requested device "
+            f"{device}: {problems[:20]}"
+        )
 
 
 def make_train_transform(config):
@@ -172,12 +198,47 @@ def prepare_config(args, checkpoint_payload):
 
 
 def build_optimizer(model):
-    configured = model.configure_optimizers()
-    if isinstance(configured, tuple):
-        configured = configured[0]
-    if isinstance(configured, list):
-        configured = configured[0]
-    return configured
+    import torch
+
+    lr = model.learning_rate
+    params = []
+    if getattr(model, "train_cond_stage_only", False):
+        print(f"{model.__class__.__name__}: Only optimizing conditioner params with duplicate filtering!", flush=True)
+        params.extend(model.cond_stage_model.parameters())
+        for name, param in model.named_parameters():
+            if name.startswith("cond_stage_model."):
+                continue
+            if "attn2" in name or "time_embed_condtion" in name or "norm2" in name:
+                params.append(param)
+    else:
+        params.extend(model.model.parameters())
+        if getattr(model, "cond_stage_trainable", False):
+            params.extend(model.cond_stage_model.parameters())
+        if getattr(model, "learn_logvar", False):
+            params.append(model.logvar)
+
+    unique_params = []
+    seen = set()
+    duplicate_count = 0
+    for param in params:
+        if not param.requires_grad:
+            param.requires_grad = True
+        param_id = id(param)
+        if param_id in seen:
+            duplicate_count += 1
+            continue
+        seen.add(param_id)
+        unique_params.append(param)
+
+    if not unique_params:
+        raise RuntimeError("No trainable parameters were selected for the optimizer.")
+
+    print(
+        f"optimizer params: {len(unique_params)} unique tensors"
+        + (f", filtered duplicates: {duplicate_count}" if duplicate_count else ""),
+        flush=True,
+    )
+    return torch.optim.AdamW(unique_params, lr=lr)
 
 
 def save_checkpoint(path, model, config, optimizer, global_step, source_checkpoint, device):
@@ -333,6 +394,8 @@ def main():
             batch = next(data_iter)
 
         batch = move_to_device(batch, device)
+        if global_step == 0:
+            check_batch_devices(batch, device)
         optimizer.zero_grad(set_to_none=True)
         loss, loss_dict = model.shared_step(batch)
         loss.backward()
