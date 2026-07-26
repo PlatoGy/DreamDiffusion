@@ -53,7 +53,12 @@ def parse_args():
     parser.add_argument("--config_patch", type=Path, default=None,
                         help="Stable Diffusion config path. Defaults to pretrain_root/models/config15.yaml.")
     parser.add_argument("--output_dir", type=Path, default=Path("checkpoints/sanity_resume"))
-    parser.add_argument("--max_steps", type=int, default=20)
+    parser.add_argument("--max_steps", type=int, default=20,
+                        help="Number of optimizer steps to run in this invocation. Ignored when --target_step is set.")
+    parser.add_argument("--start_step", type=int, default=None,
+                        help="Cumulative optimizer step of the checkpoint you are resuming from.")
+    parser.add_argument("--target_step", type=int, default=None,
+                        help="Cumulative optimizer step to train to. Runs target_step - start_step steps.")
     parser.add_argument("--save_every_n_steps", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=0)
@@ -107,6 +112,43 @@ def tensor_to_float(value):
     if torch.is_tensor(value):
         return float(value.detach().cpu())
     return float(value)
+
+
+def infer_checkpoint_step(checkpoint_payload):
+    for key in ("total_step", "global_step"):
+        value = checkpoint_payload.get(key)
+        if value is None:
+            continue
+        if hasattr(value, "item"):
+            value = value.item()
+        try:
+            return int(value), key
+        except (TypeError, ValueError):
+            continue
+    return 0, None
+
+
+def resolve_training_window(args, checkpoint_payload):
+    inferred_step, inferred_from = infer_checkpoint_step(checkpoint_payload)
+    start_step = args.start_step if args.start_step is not None else inferred_step
+
+    if start_step < 0:
+        raise ValueError("--start_step must be >= 0.")
+
+    if args.target_step is not None:
+        if args.target_step <= start_step:
+            raise ValueError(
+                f"--target_step ({args.target_step}) must be larger than start_step ({start_step})."
+            )
+        run_steps = args.target_step - start_step
+        target_step = args.target_step
+    else:
+        if args.max_steps <= 0:
+            raise ValueError("--max_steps must be > 0.")
+        run_steps = args.max_steps
+        target_step = start_step + run_steps
+
+    return start_step, target_step, run_steps, inferred_step, inferred_from
 
 
 def check_batch_devices(batch, device):
@@ -249,7 +291,8 @@ def build_optimizer(model):
     return torch.optim.AdamW(unique_params, lr=lr)
 
 
-def save_checkpoint(path, model, config, optimizer, global_step, source_checkpoint, device):
+def save_checkpoint(path, model, config, optimizer, run_step, total_step,
+                    start_step, target_step, source_checkpoint, device):
     import torch
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -268,7 +311,11 @@ def save_checkpoint(path, model, config, optimizer, global_step, source_checkpoi
             "config": config_to_save,
             "state": rng_state,
             "optimizer_state_dict": optimizer.state_dict(),
-            "global_step": global_step,
+            "global_step": total_step,
+            "total_step": total_step,
+            "run_step": run_step,
+            "start_step": start_step,
+            "target_step": target_step,
             "source_checkpoint": str(source_checkpoint),
         },
         path,
@@ -306,6 +353,7 @@ def main():
     checkpoint_payload = torch.load(checkpoint_path, map_location="cpu")
     if "model_state_dict" not in checkpoint_payload:
         raise KeyError(f"{checkpoint_path} does not contain key 'model_state_dict'.")
+    start_step, target_step, run_steps, inferred_step, inferred_from = resolve_training_window(args, checkpoint_payload)
 
     config = prepare_config(args, checkpoint_payload)
     torch.manual_seed(config.seed)
@@ -325,7 +373,15 @@ def main():
     print(f"imagenet_path: {args.imagenet_path}", flush=True)
     print(f"subject: {config.subject}", flush=True)
     print(f"batch_size: {config.batch_size}", flush=True)
-    print(f"max_steps: {args.max_steps}", flush=True)
+    print(f"checkpoint step inferred from: {inferred_from or 'none'} ({inferred_step})", flush=True)
+    print(f"start_step: {start_step}", flush=True)
+    print(f"target_step: {target_step}", flush=True)
+    print(f"run_steps_this_invocation: {run_steps}", flush=True)
+    if args.target_step is not None:
+        print("max_steps: ignored because --target_step is set", flush=True)
+    else:
+        print(f"max_steps: {args.max_steps}", flush=True)
+    print(f"save_every_n_steps: {args.save_every_n_steps}", flush=True)
     print(f"lr: {config.lr}", flush=True)
     print(f"clip_tune: {config.clip_tune}", flush=True)
     print(f"cls_tune: {config.cls_tune}", flush=True)
@@ -342,6 +398,11 @@ def main():
         subject=config.subject,
     )
     print(f"train samples: {len(dataset_train)}", flush=True)
+    steps_per_epoch = (len(dataset_train) + config.batch_size - 1) // config.batch_size
+    print(f"steps_per_epoch_at_current_batch_size: {steps_per_epoch}", flush=True)
+    if steps_per_epoch:
+        print(f"start_epoch_equivalent: {start_step / steps_per_epoch:.3f}", flush=True)
+        print(f"target_epoch_equivalent: {target_step / steps_per_epoch:.3f}", flush=True)
     num_voxels = dataset_train.data_len
 
     print(f"config_patch: {config_patch}", flush=True)
@@ -392,9 +453,10 @@ def main():
     if model.cond_stage_model is not None:
         model.cond_stage_model.train()
 
-    global_step = 0
+    run_step = 0
     data_iter = iter(dataloader)
-    while global_step < args.max_steps:
+    use_total_step_names = args.start_step is not None or args.target_step is not None
+    while run_step < run_steps:
         try:
             batch = next(data_iter)
         except StopIteration:
@@ -402,7 +464,7 @@ def main():
             batch = next(data_iter)
 
         batch = move_to_device(batch, device)
-        if global_step == 0:
+        if run_step == 0:
             check_batch_devices(batch, device)
         optimizer.zero_grad(set_to_none=True)
         loss, loss_dict = model.shared_step(batch)
@@ -410,25 +472,41 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         optimizer.step()
 
-        global_step += 1
-        parts = [f"step {global_step}/{args.max_steps}", f"loss={tensor_to_float(loss):.6f}"]
+        run_step += 1
+        total_step = start_step + run_step
+        parts = [
+            f"run_step {run_step}/{run_steps}",
+            f"total_step {total_step}/{target_step}",
+            f"loss={tensor_to_float(loss):.6f}",
+        ]
         for key, value in sorted(loss_dict.items()):
             parts.append(f"{key}={tensor_to_float(value):.6f}")
         print(" | ".join(parts), flush=True)
 
-        if args.save_every_n_steps and global_step % args.save_every_n_steps == 0:
+        if args.save_every_n_steps and run_step % args.save_every_n_steps == 0:
+            name_step = total_step if use_total_step_names else run_step
+            filename = f"resume_total_{name_step}steps.pth" if use_total_step_names else f"resume_{name_step}steps.pth"
             save_checkpoint(
-                output_dir / f"resume_{global_step}steps.pth",
+                output_dir / filename,
                 model,
                 config,
                 optimizer,
-                global_step,
+                run_step,
+                total_step,
+                start_step,
+                target_step,
                 checkpoint_path,
                 device,
             )
 
-    final_path = output_dir / f"resume_{args.max_steps}steps.pth"
-    save_checkpoint(final_path, model, config, optimizer, global_step, checkpoint_path, device)
+    final_name = (
+        f"resume_total_{target_step}steps.pth"
+        if use_total_step_names
+        else f"resume_{run_steps}steps.pth"
+    )
+    final_path = output_dir / final_name
+    save_checkpoint(final_path, model, config, optimizer, run_step, target_step,
+                    start_step, target_step, checkpoint_path, device)
     print(f"final checkpoint for gen_eval_eeg.py --model_path: {final_path}", flush=True)
 
 
