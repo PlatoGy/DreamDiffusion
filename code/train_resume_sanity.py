@@ -66,6 +66,8 @@ def parse_args():
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--subject", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--skip_bad_images", action="store_true",
+                        help="Skip samples whose ImageNet JPEG cannot be opened during training.")
     parser.add_argument("--disable_clip_tune", action="store_true",
                         help="Debug escape hatch. By default this keeps the checkpoint config's clip_tune value.")
     parser.add_argument("--disable_cls_tune", action="store_true",
@@ -149,6 +151,32 @@ def resolve_training_window(args, checkpoint_payload):
         target_step = start_step + run_steps
 
     return start_step, target_step, run_steps, inferred_step, inferred_from
+
+
+class SkipBadImageDataset:
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        from PIL import UnidentifiedImageError
+
+        try:
+            return self.dataset[index]
+        except (UnidentifiedImageError, OSError) as exc:
+            print(f"skipping bad image sample index {index}: {type(exc).__name__}: {exc}", flush=True)
+            return None
+
+
+def collate_skip_none(batch):
+    from torch.utils.data._utils.collate import default_collate
+
+    batch = [item for item in batch if item is not None]
+    if not batch:
+        return None
+    return default_collate(batch)
 
 
 def check_batch_devices(batch, device):
@@ -382,6 +410,7 @@ def main():
     else:
         print(f"max_steps: {args.max_steps}", flush=True)
     print(f"save_every_n_steps: {args.save_every_n_steps}", flush=True)
+    print(f"skip_bad_images: {args.skip_bad_images}", flush=True)
     print(f"lr: {config.lr}", flush=True)
     print(f"clip_tune: {config.clip_tune}", flush=True)
     print(f"cls_tune: {config.cls_tune}", flush=True)
@@ -438,13 +467,18 @@ def main():
     model.output_path = str(output_dir)
 
     optimizer = build_optimizer(model)
+    dataset_for_loader = SkipBadImageDataset(dataset_train) if args.skip_bad_images else dataset_train
+    dataloader_kwargs = {}
+    if args.skip_bad_images:
+        dataloader_kwargs["collate_fn"] = collate_skip_none
     dataloader = DataLoader(
-        dataset_train,
+        dataset_for_loader,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
         drop_last=False,
+        **dataloader_kwargs,
     )
     if len(dataloader) == 0:
         raise RuntimeError("training dataloader is empty.")
@@ -456,12 +490,21 @@ def main():
     run_step = 0
     data_iter = iter(dataloader)
     use_total_step_names = args.start_step is not None or args.target_step is not None
+    empty_batch_count = 0
     while run_step < run_steps:
         try:
             batch = next(data_iter)
         except StopIteration:
             data_iter = iter(dataloader)
             batch = next(data_iter)
+
+        if batch is None:
+            empty_batch_count += 1
+            if empty_batch_count > len(dataloader):
+                raise RuntimeError("All batches were empty after skipping bad images.")
+            print("skipped empty batch after filtering bad images", flush=True)
+            continue
+        empty_batch_count = 0
 
         batch = move_to_device(batch, device)
         if run_step == 0:
