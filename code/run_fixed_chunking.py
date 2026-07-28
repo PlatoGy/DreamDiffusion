@@ -17,6 +17,20 @@ if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 
 
+ROUTING_MODES = ["baseline", "uniform", "forward", "reverse", "constant1", "constant2", "constant3"]
+ROUTING_ALIASES = {
+    "constant": "constant2",
+    "instant": "constant2",
+    "constant-middle": "constant2",
+    "constant_middle": "constant2",
+    "instant-middle": "constant2",
+    "instant_middle": "constant2",
+    "instant1": "constant1",
+    "instant2": "constant2",
+    "instant3": "constant3",
+}
+
+
 def parse_limit(value):
     if value is None or value == "all":
         return None
@@ -26,6 +40,14 @@ def parse_limit(value):
     return value
 
 
+def normalize_routing_mode(value):
+    normalized = ROUTING_ALIASES.get(value, value)
+    if normalized not in ROUTING_MODES:
+        valid = ", ".join(ROUTING_MODES + sorted(ROUTING_ALIASES))
+        raise ValueError(f"Unknown --routing-mode {value!r}. Valid modes/aliases: {valid}")
+    return normalized
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Fixed EEG chunk routing experiments for DreamDiffusion inference."
@@ -33,24 +55,37 @@ def parse_args():
     parser.add_argument("--stage", choices=["sample", "train"], default="sample")
     parser.add_argument(
         "--routing-mode",
-        choices=["baseline", "uniform", "forward", "reverse", "constant1", "constant2", "constant3"],
         default="baseline",
+        help=(
+            "baseline, uniform, forward, reverse, constant1, constant2, constant3. "
+            "Aliases: instant/constant -> constant2, instant1/2/3 -> constant1/2/3."
+        ),
     )
     parser.add_argument("--root", type=Path, default=Path("."))
     parser.add_argument("--dataset", type=str, default="EEG")
-    parser.add_argument("--model_path", "--checkpoint", dest="model_path", type=Path, required=False,
+    parser.add_argument("--model_path", "--model-path", "--checkpoint", "--pretrained_generation_checkpoint",
+                        dest="model_path", type=Path, required=False,
                         default=Path("pretrains/eeg_pretrain/checkpoint.pth"))
-    parser.add_argument("--splits_path", type=Path, default=Path("datasets/block_splits_by_image_single.pth"))
-    parser.add_argument("--eeg_signals_path", type=Path, default=Path("datasets/eeg_5_95_std.pth"))
-    parser.add_argument("--config_patch", type=Path, default=Path("pretrains/models/config15.yaml"))
-    parser.add_argument("--imagenet_path", type=Path, default=Path("datasets/imageNet_images"))
+    parser.add_argument("--splits_path", "--splits-path", dest="splits_path", type=Path,
+                        default=Path("datasets/block_splits_by_image_single.pth"))
+    parser.add_argument("--eeg_signals_path", "--eeg-signals-path", dest="eeg_signals_path", type=Path,
+                        default=Path("datasets/eeg_5_95_std.pth"))
+    parser.add_argument("--config_patch", "--config-patch", dest="config_patch", type=Path,
+                        default=Path("pretrains/models/config15.yaml"))
+    parser.add_argument("--imagenet_path", "--imagenet-path", dest="imagenet_path", type=Path,
+                        default=Path("datasets/imageNet_images"))
     parser.add_argument("--subject", type=int, default=4)
-    parser.add_argument("--limit", default=None, help="1, 5, all, or omit for all.")
+    parser.add_argument("--test_limit", "--test-limit", "--limit", dest="limit", default=None,
+                        help="Number of test EEG samples to generate. Use 1, 5, all, or omit for all.")
     parser.add_argument("--seed", type=int, default=2022)
-    parser.add_argument("--output-dir", type=Path, default=Path("results/fixed_chunking"))
+    parser.add_argument("--output-dir", "--output_dir", dest="output_dir", type=Path,
+                        default=Path("results/fixed_chunking"))
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
-    parser.add_argument("--num-sampling-steps", type=int, default=None)
-    parser.add_argument("--num-samples", type=int, default=None)
+    parser.add_argument("--num-sampling-steps", "--ddim_steps", "--ddim-steps",
+                        dest="num_sampling_steps", type=int, default=None)
+    parser.add_argument("--num-samples", "--num_samples", dest="num_samples", type=int, default=None)
+    parser.add_argument("--skip_train_preview", action="store_true",
+                        help="Accepted for parity with gen_eval_eeg_param.py. Fixed chunking only samples test data.")
     parser.add_argument("--debug-shapes", action="store_true")
     parser.add_argument("--save-routing-metadata", action="store_true")
     parser.add_argument("--run-tests", action="store_true", help="Run routing math tests and exit.")
@@ -64,7 +99,13 @@ def parse_args():
             "preserve is kept only for documentation and is not supported by the official checkpoint."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.routing_mode = normalize_routing_mode(args.routing_mode)
+    if args.num_sampling_steps is not None and args.num_sampling_steps <= 0:
+        raise ValueError("--num-sampling-steps/--ddim_steps must be positive.")
+    if args.num_samples is not None and args.num_samples <= 0:
+        raise ValueError("--num-samples/--num_samples must be positive.")
+    return args
 
 
 def resolve_path(root, path):
@@ -681,6 +722,8 @@ def write_metadata(path, args, routing_state, config, generated_count, paths):
         "sampling_steps": config.ddim_steps,
         "sampler_name": "PLMS",
         "sampler": "PLMS",
+        "limit": parse_limit(args.limit),
+        "limit_arg": args.limit,
         "dataset_split": paths["splits_path"],
         "number_of_generated_samples": generated_count,
         "number_of_samples": generated_count,
@@ -736,6 +779,14 @@ def main():
 
     routing_state = RoutingState(args.routing_mode, args.eps)
     print(f"routing mode: {args.routing_mode}", flush=True)
+    print(f"model_path: {args.model_path}", flush=True)
+    print(f"limit: {args.limit}", flush=True)
+    print(f"num_samples per EEG override: {args.num_samples}", flush=True)
+    print(f"ddim_steps override: {args.num_sampling_steps}", flush=True)
+    print(f"subject: {args.subject}", flush=True)
+    print(f"output root: {output_root}", flush=True)
+    if args.skip_train_preview:
+        print("skip_train_preview: ignored because fixed chunking only samples test data.", flush=True)
     if args.routing_mode != "baseline":
         print(f"early weights: {stage_weights(args.routing_mode, 0.1)}", flush=True)
         print(f"middle weights: {stage_weights(args.routing_mode, 0.5)}", flush=True)
