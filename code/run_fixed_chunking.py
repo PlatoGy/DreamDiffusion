@@ -17,18 +17,8 @@ if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 
 
-ROUTING_MODES = ["baseline", "uniform", "forward", "reverse", "constant1", "constant2", "constant3"]
-ROUTING_ALIASES = {
-    "constant": "constant2",
-    "instant": "constant2",
-    "constant-middle": "constant2",
-    "constant_middle": "constant2",
-    "instant-middle": "constant2",
-    "instant_middle": "constant2",
-    "instant1": "constant1",
-    "instant2": "constant2",
-    "instant3": "constant3",
-}
+ROUTING_MODES = ["baseline", "uniform", "forward", "reverse", "instant1", "instant2", "instant3"]
+ROUTING_ALIASES = {}
 
 
 def parse_limit(value):
@@ -57,8 +47,8 @@ def parse_args():
         "--routing-mode",
         default="baseline",
         help=(
-            "baseline, uniform, forward, reverse, constant1, constant2, constant3. "
-            "Aliases: instant/constant -> constant2, instant1/2/3 -> constant1/2/3."
+            "baseline, uniform, forward, reverse, instant1, instant2, instant3. "
+            "Plain instant is intentionally unsupported."
         ),
     )
     parser.add_argument("--root", type=Path, default=Path("."))
@@ -191,11 +181,11 @@ def get_chunk_weights(routing_mode, progress, device=None, dtype=None):
         weights[early] = torch.tensor([0.1, 0.1, 0.8], device=weights.device)
         weights[middle] = torch.tensor([0.1, 0.8, 0.1], device=weights.device)
         weights[late] = torch.tensor([0.8, 0.1, 0.1], device=weights.device)
-    elif routing_mode == "constant1":
+    elif routing_mode == "instant1":
         weights[:] = torch.tensor([0.8, 0.1, 0.1], device=weights.device)
-    elif routing_mode == "constant2":
+    elif routing_mode == "instant2":
         weights[:] = torch.tensor([0.1, 0.8, 0.1], device=weights.device)
-    elif routing_mode == "constant3":
+    elif routing_mode == "instant3":
         weights[:] = torch.tensor([0.1, 0.1, 0.8], device=weights.device)
     else:
         raise ValueError(routing_mode)
@@ -228,15 +218,15 @@ def validate_stage_weights():
         "reverse@early": stage_weights("reverse", 0.1),
         "reverse@middle": stage_weights("reverse", 0.5),
         "reverse@late": stage_weights("reverse", 0.9),
-        "constant1@early": stage_weights("constant1", 0.1),
-        "constant1@middle": stage_weights("constant1", 0.5),
-        "constant1@late": stage_weights("constant1", 0.9),
-        "constant2@early": stage_weights("constant2", 0.1),
-        "constant2@middle": stage_weights("constant2", 0.5),
-        "constant2@late": stage_weights("constant2", 0.9),
-        "constant3@early": stage_weights("constant3", 0.1),
-        "constant3@middle": stage_weights("constant3", 0.5),
-        "constant3@late": stage_weights("constant3", 0.9),
+        "instant1@early": stage_weights("instant1", 0.1),
+        "instant1@middle": stage_weights("instant1", 0.5),
+        "instant1@late": stage_weights("instant1", 0.9),
+        "instant2@early": stage_weights("instant2", 0.1),
+        "instant2@middle": stage_weights("instant2", 0.5),
+        "instant2@late": stage_weights("instant2", 0.9),
+        "instant3@early": stage_weights("instant3", 0.1),
+        "instant3@middle": stage_weights("instant3", 0.5),
+        "instant3@late": stage_weights("instant3", 0.9),
     }
     expected = {
         "uniform@0": [1.0 / 3.0] * 3,
@@ -248,15 +238,15 @@ def validate_stage_weights():
         "reverse@early": [0.1, 0.1, 0.8],
         "reverse@middle": [0.1, 0.8, 0.1],
         "reverse@late": [0.8, 0.1, 0.1],
-        "constant1@early": [0.8, 0.1, 0.1],
-        "constant1@middle": [0.8, 0.1, 0.1],
-        "constant1@late": [0.8, 0.1, 0.1],
-        "constant2@early": [0.1, 0.8, 0.1],
-        "constant2@middle": [0.1, 0.8, 0.1],
-        "constant2@late": [0.1, 0.8, 0.1],
-        "constant3@early": [0.1, 0.1, 0.8],
-        "constant3@middle": [0.1, 0.1, 0.8],
-        "constant3@late": [0.1, 0.1, 0.8],
+        "instant1@early": [0.8, 0.1, 0.1],
+        "instant1@middle": [0.8, 0.1, 0.1],
+        "instant1@late": [0.8, 0.1, 0.1],
+        "instant2@early": [0.1, 0.8, 0.1],
+        "instant2@middle": [0.1, 0.8, 0.1],
+        "instant2@late": [0.1, 0.8, 0.1],
+        "instant3@early": [0.1, 0.1, 0.8],
+        "instant3@middle": [0.1, 0.1, 0.8],
+        "instant3@late": [0.1, 0.1, 0.8],
     }
     for key, weights in checks.items():
         if not np.allclose(weights, expected[key]):
@@ -273,7 +263,7 @@ def validate_token_prior():
     validate_chunks(77, bounds)
     membership = membership_matrix(77, bounds, device="cpu", dtype=torch.float32)
     checks = {}
-    for mode in ["uniform", "forward", "reverse", "constant1", "constant2", "constant3"]:
+    for mode in ["uniform", "forward", "reverse", "instant1", "instant2", "instant3"]:
         for progress in [0.0, 0.1, 0.5, 0.9, 1.0]:
             weights = get_chunk_weights(mode, progress, device=torch.device("cpu"), dtype=torch.float32)
             pi = weights @ membership
@@ -417,9 +407,9 @@ def routing_weight_summary(mode):
     }
 
 
-def constant_chunk(mode):
-    if mode.startswith("constant"):
-        return int(mode.replace("constant", ""))
+def instant_chunk(mode):
+    if mode.startswith("instant"):
+        return int(mode.replace("instant", ""))
     return None
 
 
@@ -709,11 +699,11 @@ def write_metadata(path, args, routing_state, config, generated_count, paths):
             "uniform": routing_weight_summary("uniform"),
             "forward": routing_weight_summary("forward"),
             "reverse": routing_weight_summary("reverse"),
-            "constant1": routing_weight_summary("constant1"),
-            "constant2": routing_weight_summary("constant2"),
-            "constant3": routing_weight_summary("constant3"),
+            "instant1": routing_weight_summary("instant1"),
+            "instant2": routing_weight_summary("instant2"),
+            "instant3": routing_weight_summary("instant3"),
         },
-        "constant_chunk": constant_chunk(args.routing_mode),
+        "instant_chunk": instant_chunk(args.routing_mode),
         "seed": args.seed,
         "checkpoint_path": paths["checkpoint_path"],
         "checkpoint": paths["checkpoint_path"],
