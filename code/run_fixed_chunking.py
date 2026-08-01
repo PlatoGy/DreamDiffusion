@@ -34,7 +34,7 @@ def normalize_routing_mode(value):
     normalized = ROUTING_ALIASES.get(value, value)
     if normalized not in ROUTING_MODES:
         valid = ", ".join(ROUTING_MODES + sorted(ROUTING_ALIASES))
-        raise ValueError(f"Unknown --routing-mode {value!r}. Valid modes/aliases: {valid}")
+        raise ValueError(f"Unknown --routing_mode {value!r}. Valid modes: {valid}")
     return normalized
 
 
@@ -44,7 +44,7 @@ def parse_args():
     )
     parser.add_argument("--stage", choices=["sample", "train"], default="sample")
     parser.add_argument(
-        "--routing-mode",
+        "--routing_mode",
         default="baseline",
         help=(
             "baseline, uniform, forward, reverse, instant1, instant2, instant3. "
@@ -53,35 +53,35 @@ def parse_args():
     )
     parser.add_argument("--root", type=Path, default=Path("."))
     parser.add_argument("--dataset", type=str, default="EEG")
-    parser.add_argument("--model_path", "--model-path", "--checkpoint", "--pretrained_generation_checkpoint",
-                        dest="model_path", type=Path, required=False,
+    parser.add_argument("--model_path", type=Path, required=False,
                         default=Path("pretrains/eeg_pretrain/checkpoint.pth"))
-    parser.add_argument("--splits_path", "--splits-path", dest="splits_path", type=Path,
+    parser.add_argument("--splits_path", type=Path,
                         default=Path("datasets/block_splits_by_image_single.pth"))
-    parser.add_argument("--eeg_signals_path", "--eeg-signals-path", dest="eeg_signals_path", type=Path,
+    parser.add_argument("--eeg_signals_path", type=Path,
                         default=Path("datasets/eeg_5_95_std.pth"))
-    parser.add_argument("--config_patch", "--config-patch", dest="config_patch", type=Path,
+    parser.add_argument("--config_patch", type=Path,
                         default=Path("pretrains/models/config15.yaml"))
-    parser.add_argument("--imagenet_path", "--imagenet-path", dest="imagenet_path", type=Path,
+    parser.add_argument("--imagenet_path", type=Path,
                         default=Path("datasets/imageNet_images"))
     parser.add_argument("--subject", type=int, default=4)
-    parser.add_argument("--test_limit", "--test-limit", "--limit", dest="limit", default=None,
+    parser.add_argument("--test_limit", "--limit", dest="test_limit", default=None,
                         help="Number of test EEG samples to generate. Use 1, 5, all, or omit for all.")
+    parser.add_argument("--train_limit", default=None,
+                        help="Accepted for parity with gen_eval_eeg_param.py. Fixed chunking only samples test data.")
     parser.add_argument("--seed", type=int, default=2022)
-    parser.add_argument("--output-dir", "--output_dir", dest="output_dir", type=Path,
+    parser.add_argument("--output_dir", type=Path,
                         default=Path("results/fixed_chunking"))
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
-    parser.add_argument("--num-sampling-steps", "--ddim_steps", "--ddim-steps",
-                        dest="num_sampling_steps", type=int, default=None)
-    parser.add_argument("--num-samples", "--num_samples", dest="num_samples", type=int, default=None)
+    parser.add_argument("--ddim_steps", type=int, default=None)
+    parser.add_argument("--num_samples", type=int, default=None)
     parser.add_argument("--skip_train_preview", action="store_true",
                         help="Accepted for parity with gen_eval_eeg_param.py. Fixed chunking only samples test data.")
-    parser.add_argument("--debug-shapes", action="store_true")
-    parser.add_argument("--save-routing-metadata", action="store_true")
-    parser.add_argument("--run-tests", action="store_true", help="Run routing math tests and exit.")
+    parser.add_argument("--debug_shapes", action="store_true")
+    parser.add_argument("--save_routing_metadata", action="store_true")
+    parser.add_argument("--run_tests", action="store_true", help="Run routing math tests and exit.")
     parser.add_argument("--eps", type=float, default=1e-8)
     parser.add_argument(
-        "--time-token-policy",
+        "--time_token_policy",
         choices=["auto", "post_projector", "preserve"],
         default="auto",
         help=(
@@ -91,10 +91,10 @@ def parse_args():
     )
     args = parser.parse_args()
     args.routing_mode = normalize_routing_mode(args.routing_mode)
-    if args.num_sampling_steps is not None and args.num_sampling_steps <= 0:
-        raise ValueError("--num-sampling-steps/--ddim_steps must be positive.")
+    if args.ddim_steps is not None and args.ddim_steps <= 0:
+        raise ValueError("--ddim_steps must be positive.")
     if args.num_samples is not None and args.num_samples <= 0:
-        raise ValueError("--num-samples/--num_samples must be positive.")
+        raise ValueError("--num_samples must be positive.")
     return args
 
 
@@ -547,8 +547,8 @@ def build_model_and_data(args, routing_state):
     sd = torch.load(model_path, map_location="cpu")
     config = sd["config"]
     config.root_path = str(root)
-    if args.num_sampling_steps is not None:
-        config.ddim_steps = args.num_sampling_steps
+    if args.ddim_steps is not None:
+        config.ddim_steps = args.ddim_steps
     if args.num_samples is not None:
         config.num_samples = args.num_samples
 
@@ -606,7 +606,7 @@ def save_image_grid_and_samples(generative_model, dataset, config, args, routing
 
     from dc_ldm.models.diffusion.plms import PLMSSampler
 
-    limit = parse_limit(args.limit)
+    limit = parse_limit(args.test_limit)
     model = generative_model.model.to(generative_model.device)
     model.eval()
     sampler = PLMSSampler(model) if args.routing_mode == "baseline" else RoutingPLMSSampler(model, routing_state)
@@ -669,7 +669,7 @@ def save_image_grid_and_samples(generative_model, dataset, config, args, routing
                 Image.fromarray(img_t).save(output_dir / f"test{count}-{copy_idx}.png")
 
     if not all_samples:
-        raise RuntimeError("No samples generated. Check --limit and dataset.")
+        raise RuntimeError("No samples generated. Check --test_limit/--limit and dataset.")
 
     grid = torch.stack(all_samples, 0)
     grid = rearrange(grid, "n b c h w -> (n b) c h w")
@@ -712,8 +712,10 @@ def write_metadata(path, args, routing_state, config, generated_count, paths):
         "sampling_steps": config.ddim_steps,
         "sampler_name": "PLMS",
         "sampler": "PLMS",
-        "limit": parse_limit(args.limit),
-        "limit_arg": args.limit,
+        "test_limit": parse_limit(args.test_limit),
+        "test_limit_arg": args.test_limit,
+        "train_limit_arg_ignored": args.train_limit,
+        "skip_train_preview_arg_ignored": args.skip_train_preview,
         "dataset_split": paths["splits_path"],
         "number_of_generated_samples": generated_count,
         "number_of_samples": generated_count,
@@ -770,9 +772,10 @@ def main():
     routing_state = RoutingState(args.routing_mode, args.eps)
     print(f"routing mode: {args.routing_mode}", flush=True)
     print(f"model_path: {args.model_path}", flush=True)
-    print(f"limit: {args.limit}", flush=True)
+    print(f"test_limit: {args.test_limit}", flush=True)
+    print(f"train_limit: {args.train_limit} (ignored; fixed chunking only samples test data)", flush=True)
     print(f"num_samples per EEG override: {args.num_samples}", flush=True)
-    print(f"ddim_steps override: {args.num_sampling_steps}", flush=True)
+    print(f"ddim_steps override: {args.ddim_steps}", flush=True)
     print(f"subject: {args.subject}", flush=True)
     print(f"output root: {output_root}", flush=True)
     if args.skip_train_preview:
@@ -787,7 +790,7 @@ def main():
     if args.routing_mode != "baseline":
         if args.time_token_policy == "preserve":
             raise RuntimeError(
-                "--time-token-policy preserve is incompatible with the official checkpoint: "
+                "--time_token_policy preserve is incompatible with the official checkpoint: "
                 "the U-Net was trained to receive the original post-projector conditioning tokens, "
                 "not raw EEG encoder tokens."
             )
