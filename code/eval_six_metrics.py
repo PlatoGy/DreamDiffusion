@@ -279,6 +279,12 @@ def np_to_nchw_float(images):
     return torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous()
 
 
+def np_to_nchw_uint8(images):
+    arr = np.stack(images, axis=0)
+    arr = np.clip(np.rint(arr * 255.0), 0, 255).astype(np.uint8)
+    return torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous()
+
+
 def batch_iter(items, batch_size):
     for start in range(0, len(items), batch_size):
         yield items[start:start + batch_size]
@@ -368,16 +374,19 @@ def compute_fid(pairs, device, batch_size, feature):
 
     check_torch_fidelity_inception_cache("FID")
     try:
-        metric = FrechetInceptionDistance(feature=feature, normalize=True).to(device)
+        try:
+            metric = FrechetInceptionDistance(feature=feature, normalize=False).to(device)
+        except TypeError:
+            metric = FrechetInceptionDistance(feature=feature).to(device)
     except Exception as exc:
         raise metric_dependency_error("FID", exc) from exc
     metric.eval()
     try:
         for batch in tqdm(list(batch_iter(pairs, batch_size)), desc="FID real", leave=False):
-            gt = np_to_nchw_float([x["ground_truth"] for x in batch]).to(device)
+            gt = np_to_nchw_uint8([x["ground_truth"] for x in batch]).to(device)
             metric.update(gt, real=True)
         for batch in tqdm(list(batch_iter(pairs, batch_size)), desc="FID generated", leave=False):
-            pred = np_to_nchw_float([x["generated"] for x in batch]).to(device)
+            pred = np_to_nchw_uint8([x["generated"] for x in batch]).to(device)
             metric.update(pred, real=False)
         value = float(metric.compute().detach().cpu())
         return value
@@ -404,13 +413,16 @@ def compute_inception_score(pairs, device, batch_size, requested_splits):
         print(f"[WARN] IS splits reduced from {requested_splits} to {splits} for {len(pairs)} images.", flush=True)
     check_torch_fidelity_inception_cache("Inception Score")
     try:
-        metric = InceptionScore(splits=splits, normalize=True).to(device)
+        try:
+            metric = InceptionScore(splits=splits, normalize=False).to(device)
+        except TypeError:
+            metric = InceptionScore(splits=splits).to(device)
     except Exception as exc:
         raise metric_dependency_error("Inception Score", exc) from exc
     metric.eval()
     try:
         for batch in tqdm(list(batch_iter(pairs, batch_size)), desc="Inception Score", leave=False):
-            pred = np_to_nchw_float([x["generated"] for x in batch]).to(device)
+            pred = np_to_nchw_uint8([x["generated"] for x in batch]).to(device)
             metric.update(pred)
         mean, std = metric.compute()
         mean = float(mean.detach().cpu())
