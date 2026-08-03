@@ -141,7 +141,12 @@ class MethodState:
         return p
 
     def encode_condition(self, cond_stage, x):
-        h = cond_stage.mae(x)
+        h_full = cond_stage.mae(x)
+        h = h_full
+        if not getattr(cond_stage, "global_pool", False) and hasattr(cond_stage, "channel_mapper"):
+            h = h.transpose(1, 2)
+            h = cond_stage.channel_mapper(h)
+            h = h.transpose(1, 2).contiguous()
         self.h_tokens = h
         c = self.temporal_projector(h)
         self.context = c
@@ -152,9 +157,11 @@ class MethodState:
         self.membership = membership
         self.shape_audit = {
             "raw_eeg_X": list(x.shape),
-            "encoder_H": list(h.shape),
+            "encoder_H_full": list(h_full.shape),
+            "pooled_H_for_dynamic_chunking": list(h.shape),
             "temporal_context_C": list(c.shape),
-            "N_H": int(h.shape[1]),
+            "N_H_full": int(h_full.shape[1]),
+            "N_dynamic": int(h.shape[1]),
             "N_C": int(c.shape[1]),
             "H_feature_dim": int(h.shape[-1]),
             "C_feature_dim": int(c.shape[-1]),
@@ -162,11 +169,11 @@ class MethodState:
             "projector_mixes_token_dimension": False,
             "existing_conditioner_has_channel_mapper": hasattr(cond_stage, "channel_mapper"),
             "existing_channel_mapper_note": (
-                "The original/current conditioner may pool token dimension to 77; "
-                "this method path bypasses it and uses temporal_projector(H) with N_C=N_H."
+                "Dynamic chunking now keeps the trained conditioner token policy: "
+                "MAE output is pooled by cond_stage_model.channel_mapper before boundary prediction."
             ),
         }
-        return c, h
+        return c, h_full
 
     def bias_for_context(self, context, dtype):
         if self.membership is None:
@@ -391,7 +398,6 @@ def configure_trainable(model, scope):
         param.requires_grad = False
     trainable_prefixes = ["dynamic_boundary_predictor.", "diffusion_time_router.", "dynamic_temporal_projector."]
     if scope == "method":
-        trainable_prefixes.extend(["cond_stage_model.mae.", "cond_stage_model.mapping."])
         trainable_contains = ["attn2"]
     elif scope == "boundary_router_only":
         trainable_contains = []
@@ -637,7 +643,12 @@ def run_one_backward(model, batch, method_state, args, device, optimizer=None):
 
 
 def assert_sanity(model, method_state, args, device):
-    b, n, d = 4, 110, model.cond_stage_model.mae.embed_dim
+    if not getattr(model.cond_stage_model, "global_pool", False) and hasattr(model.cond_stage_model, "channel_mapper"):
+        output_size = getattr(model.cond_stage_model.channel_mapper, "output_size", 77)
+        n = int(output_size[0] if isinstance(output_size, (tuple, list)) else output_size)
+    else:
+        n = int(getattr(model.cond_stage_model.mae, "num_patches", 110))
+    b, d = 4, model.cond_stage_model.mae.embed_dim
     h = torch.randn(b, n, d, device=device, requires_grad=True)
     lengths, boundaries, _ = model.dynamic_boundary_predictor(h)
     if lengths.shape != (b, 3):
@@ -769,9 +780,19 @@ def main():
                 ]
                 if frozen_bad:
                     raise AssertionError(f"Frozen parameters received gradients: {frozen_bad[:20]}")
-                for label, value in grad_stats.items():
-                    if args.train_scope == "method" and value == 0:
-                        raise AssertionError(f"Expected nonzero gradient for {label}")
+                if args.train_scope == "method":
+                    if any(p.requires_grad for p in model.cond_stage_model.mae.parameters()):
+                        raise AssertionError("cond_stage_model.mae should be frozen in method scope.")
+                    if hasattr(model.cond_stage_model, "mapping") and any(
+                        p.requires_grad for p in model.cond_stage_model.mapping.parameters()
+                    ):
+                        raise AssertionError("cond_stage_model.mapping should be frozen in method scope.")
+                    expected_positive = ["grad/boundary", "grad/router", "grad/eeg_projector", "grad/cross_attention"]
+                    for label in expected_positive:
+                        if grad_stats[label] == 0:
+                            raise AssertionError(f"Expected nonzero gradient for {label}")
+                    if grad_stats["grad/eeg_encoder"] != 0:
+                        raise AssertionError("Expected zero gradient for frozen grad/eeg_encoder")
                 print("sanity backward/frozen tests passed", flush=True)
                 break
 
