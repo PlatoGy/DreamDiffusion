@@ -311,19 +311,28 @@ def compute_lpips_scores(pairs, device, batch_size):
             "LPIPS requires torchmetrics with image dependencies. Try: pip install torchmetrics lpips"
         ) from exc
 
+    per_image_fallback = False
     try:
         metric = LearnedPerceptualImagePatchSimilarity(net_type="alex", normalize=False, reduction="none").to(device)
-    except TypeError:
+    except (TypeError, ValueError):
         try:
             metric = LearnedPerceptualImagePatchSimilarity(net_type="alex", reduction="none").to(device)
-        except TypeError:
-            metric = LearnedPerceptualImagePatchSimilarity(net_type="alex").to(device)
+        except (TypeError, ValueError):
+            try:
+                metric = LearnedPerceptualImagePatchSimilarity(net_type="alex", normalize=False, reduction="mean").to(device)
+            except TypeError:
+                metric = LearnedPerceptualImagePatchSimilarity(net_type="alex").to(device)
+            per_image_fallback = True
     metric.eval()
 
     scores = []
     for batch in tqdm(list(batch_iter(pairs, batch_size)), desc="LPIPS", leave=False):
         pred = np_to_nchw_float([x["generated"] for x in batch]).to(device) * 2.0 - 1.0
         gt = np_to_nchw_float([x["ground_truth"] for x in batch]).to(device) * 2.0 - 1.0
+        if per_image_fallback:
+            for pred_one, gt_one in zip(pred, gt):
+                scores.append(float(metric(pred_one.unsqueeze(0), gt_one.unsqueeze(0)).detach().cpu()))
+            continue
         value = metric(pred, gt)
         if value.ndim == 0:
             if len(batch) == 1:
