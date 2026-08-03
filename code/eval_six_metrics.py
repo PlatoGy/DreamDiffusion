@@ -24,6 +24,12 @@ except Exception:  # pragma: no cover - tqdm is optional for argument inspection
 TEST_IMAGE_RE = re.compile(r"^test(?P<sample>\d+)-(?P<copy>\d+)\.(png|jpg|jpeg)$", re.IGNORECASE)
 PRED_DIR_RE = re.compile(r"^(prediction|pred|copy|sample)[_-]?(?P<pred>\d+)$", re.IGNORECASE)
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+TORCH_FIDELITY_INCEPTION_URL = (
+    "https://github.com/toshas/torch-fidelity/releases/download/v0.2.0/"
+    "weights-inception-2015-12-05-6726825d.pth"
+)
+TORCH_FIDELITY_INCEPTION_FILENAME = "weights-inception-2015-12-05-6726825d.pth"
+TORCH_FIDELITY_INCEPTION_MIN_BYTES = 90 * 1024 * 1024
 
 
 class EvaluationError(RuntimeError):
@@ -360,19 +366,27 @@ def compute_fid(pairs, device, batch_size, feature):
             "Try: pip install torchmetrics torch-fidelity"
         ) from exc
 
-    metric = FrechetInceptionDistance(feature=feature, normalize=True).to(device)
+    check_torch_fidelity_inception_cache("FID")
+    try:
+        metric = FrechetInceptionDistance(feature=feature, normalize=True).to(device)
+    except Exception as exc:
+        raise metric_dependency_error("FID", exc) from exc
     metric.eval()
-    for batch in tqdm(list(batch_iter(pairs, batch_size)), desc="FID real", leave=False):
-        gt = np_to_nchw_float([x["ground_truth"] for x in batch]).to(device)
-        metric.update(gt, real=True)
-    for batch in tqdm(list(batch_iter(pairs, batch_size)), desc="FID generated", leave=False):
-        pred = np_to_nchw_float([x["generated"] for x in batch]).to(device)
-        metric.update(pred, real=False)
-    value = float(metric.compute().detach().cpu())
-    del metric
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    return value
+    try:
+        for batch in tqdm(list(batch_iter(pairs, batch_size)), desc="FID real", leave=False):
+            gt = np_to_nchw_float([x["ground_truth"] for x in batch]).to(device)
+            metric.update(gt, real=True)
+        for batch in tqdm(list(batch_iter(pairs, batch_size)), desc="FID generated", leave=False):
+            pred = np_to_nchw_float([x["generated"] for x in batch]).to(device)
+            metric.update(pred, real=False)
+        value = float(metric.compute().detach().cpu())
+        return value
+    except Exception as exc:
+        raise metric_dependency_error("FID", exc) from exc
+    finally:
+        del metric
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
 
 @torch.no_grad()
@@ -388,20 +402,28 @@ def compute_inception_score(pairs, device, batch_size, requested_splits):
     splits = max(1, min(requested_splits, len(pairs)))
     if splits != requested_splits:
         print(f"[WARN] IS splits reduced from {requested_splits} to {splits} for {len(pairs)} images.", flush=True)
-    metric = InceptionScore(splits=splits, normalize=True).to(device)
+    check_torch_fidelity_inception_cache("Inception Score")
+    try:
+        metric = InceptionScore(splits=splits, normalize=True).to(device)
+    except Exception as exc:
+        raise metric_dependency_error("Inception Score", exc) from exc
     metric.eval()
-    for batch in tqdm(list(batch_iter(pairs, batch_size)), desc="Inception Score", leave=False):
-        pred = np_to_nchw_float([x["generated"] for x in batch]).to(device)
-        metric.update(pred)
-    mean, std = metric.compute()
-    mean = float(mean.detach().cpu())
-    std = float(std.detach().cpu())
-    if math.isnan(std):
-        std = 0.0
-    del metric
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    return mean, std
+    try:
+        for batch in tqdm(list(batch_iter(pairs, batch_size)), desc="Inception Score", leave=False):
+            pred = np_to_nchw_float([x["generated"] for x in batch]).to(device)
+            metric.update(pred)
+        mean, std = metric.compute()
+        mean = float(mean.detach().cpu())
+        std = float(std.detach().cpu())
+        if math.isnan(std):
+            std = 0.0
+        return mean, std
+    except Exception as exc:
+        raise metric_dependency_error("Inception Score", exc) from exc
+    finally:
+        del metric
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
 
 @torch.no_grad()
@@ -442,6 +464,47 @@ def maybe_print_weight_cache(label, url):
     else:
         print(f"[WARN] {label} cache not found at: {cache_path}", flush=True)
         print(f"[WARN] torchvision/torchmetrics may try to download: {url}", flush=True)
+
+
+def torch_fidelity_inception_cache_path():
+    return Path(torch.hub.get_dir()) / "checkpoints" / TORCH_FIDELITY_INCEPTION_FILENAME
+
+
+def check_torch_fidelity_inception_cache(metric_name):
+    cache_path = torch_fidelity_inception_cache_path()
+    if not cache_path.exists():
+        print(f"[WARN] {metric_name} Inception cache not found: {cache_path}", flush=True)
+        print(f"[WARN] torch-fidelity may download: {TORCH_FIDELITY_INCEPTION_URL}", flush=True)
+        return
+    size = cache_path.stat().st_size
+    print(f"{metric_name} Inception cache found: {cache_path} ({size / 1024 / 1024:.2f} MB)", flush=True)
+    if size < TORCH_FIDELITY_INCEPTION_MIN_BYTES:
+        raise EvaluationError(
+            f"{metric_name} Inception cache is too small and is probably a broken partial download: "
+            f"{cache_path} ({size / 1024 / 1024:.2f} MB). Delete it and download again.\n"
+            f"Server fix:\n"
+            f"rm -f {cache_path}\n"
+            f"mkdir -p {cache_path.parent}\n"
+            f"wget -c --show-progress -O {cache_path} {TORCH_FIDELITY_INCEPTION_URL}\n"
+            f"python -c \"import torch; p='{cache_path}'; sd=torch.load(p, map_location='cpu'); print(type(sd), len(sd) if hasattr(sd, '__len__') else 'ok')\""
+        )
+
+
+def metric_dependency_error(metric_name, exc):
+    message = f"{type(exc).__name__}: {exc}"
+    if "unexpected EOF" in message or "failed finding central directory" in message or "pickle data was truncated" in message:
+        cache_path = torch_fidelity_inception_cache_path()
+        return EvaluationError(
+            f"{metric_name} failed because the cached torch-fidelity Inception weight file is corrupted: {cache_path}\n"
+            f"Original error: {message}\n"
+            f"Fix on the server:\n"
+            f"rm -f {cache_path}\n"
+            f"mkdir -p {cache_path.parent}\n"
+            f"wget -c --show-progress -O {cache_path} {TORCH_FIDELITY_INCEPTION_URL}\n"
+            f"python -c \"import torch; p='{cache_path}'; sd=torch.load(p, map_location='cpu'); print(type(sd), len(sd) if hasattr(sd, '__len__') else 'ok')\"\n"
+            f"Then rerun this evaluation command. To continue without this metric, add --skip_fid and/or --skip_is."
+        )
+    return EvaluationError(f"{metric_name} failed: {message}")
 
 
 def compute_50way(pairs, device, batch_size, n_way, num_trials, seed):
@@ -794,4 +857,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except EvaluationError as exc:
+        print(f"ERROR: {exc}", flush=True)
+        raise SystemExit(1)
