@@ -15,6 +15,7 @@ if str(CODE_DIR) not in sys.path:
 
 from run_fixed_chunking import (  # noqa: E402
     RoutingState,
+    ROUTING_MODES,
     build_model_and_data,
     patch_cross_attention,
     record_original_conditioner_shapes,
@@ -29,6 +30,7 @@ def parse_args():
         description="Export four real denoising progress frames for fixed-chunk forward routing."
     )
     parser.add_argument("--root", type=Path, default=Path("."))
+    parser.add_argument("--dataset", type=str, default="EEG")
     parser.add_argument("--ckpt", "--model_path", dest="model_path", type=Path,
                         default=Path("pretrains/eeg_pretrain/checkpoint.pth"))
     parser.add_argument("--config", "--config_patch", dest="config_patch", type=Path,
@@ -37,31 +39,42 @@ def parse_args():
     parser.add_argument("--eeg_signals_path", type=Path, default=Path("datasets/eeg_5_95_std.pth"))
     parser.add_argument("--imagenet_path", type=Path, default=Path("datasets/imageNet_images"))
     parser.add_argument("--subject", type=int, default=4)
-    parser.add_argument("--routing-mode", choices=["forward"], default="forward")
-    parser.add_argument("--sample-index", type=int, default=0)
-    parser.add_argument("--prediction-index", type=int, default=0,
-                        help="Generated candidate index inside the sampling batch. Default: 0.")
+    parser.add_argument("--routing-mode", "--routing_mode", dest="routing_mode",
+                        choices=[mode for mode in ROUTING_MODES if mode != "baseline"], default="forward")
+    parser.add_argument("--sample-index", "--sample_index", type=int, default=0)
+    parser.add_argument("--prediction-index", "--prediction_index", type=int, default=1,
+                        help="Generated image index matching testX-Y.png names. Use 1..num_samples, not 0-based.")
     parser.add_argument("--seed", type=int, default=2022)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
-    parser.add_argument("--num-sampling-steps", type=int, default=250)
-    parser.add_argument("--num-samples", type=int, default=1,
+    parser.add_argument("--num-sampling-steps", "--num_sampling_steps", "--ddim_steps",
+                        dest="ddim_steps", type=int, default=250)
+    parser.add_argument("--num-samples", "--num_samples", type=int, default=1,
                         help="Sampling batch size. Use the same value when comparing with run_fixed_chunking.py.")
-    parser.add_argument("--output-dir", type=Path, default=Path("results/fixed_chunking_progress"))
-    parser.add_argument("--save-progress-grid", dest="save_progress_grid", action="store_true")
-    parser.add_argument("--no-save-progress-grid", dest="save_progress_grid", action="store_false")
-    parser.add_argument("--save-individual-frames", dest="save_individual_frames", action="store_true")
-    parser.add_argument("--no-save-individual-frames", dest="save_individual_frames", action="store_false")
-    parser.add_argument("--match-forward-rng-order", dest="match_forward_rng_order", action="store_true",
+    parser.add_argument("--output-dir", "--output_dir", type=Path, default=Path("results/fixed_chunking_progress"))
+    parser.add_argument("--save-progress-grid", "--save_progress_grid", dest="save_progress_grid", action="store_true")
+    parser.add_argument("--no-save-progress-grid", "--no_save_progress_grid", dest="save_progress_grid", action="store_false")
+    parser.add_argument("--save-individual-frames", "--save_individual_frames", dest="save_individual_frames", action="store_true")
+    parser.add_argument("--no-save-individual-frames", "--no_save_individual_frames", dest="save_individual_frames", action="store_false")
+    parser.add_argument("--match-forward-rng-order", "--match_forward_rng_order", dest="match_forward_rng_order", action="store_true",
                         help="Advance RNG so sample-index N uses the same initial noise as run_fixed_chunking.py.")
-    parser.add_argument("--no-match-forward-rng-order", dest="match_forward_rng_order", action="store_false")
+    parser.add_argument("--no-match-forward-rng-order", "--no_match_forward_rng_order", dest="match_forward_rng_order", action="store_false")
     parser.set_defaults(
         save_progress_grid=True,
         save_individual_frames=True,
         match_forward_rng_order=True,
     )
     parser.add_argument("--eps", type=float, default=1e-8)
-    parser.add_argument("--debug-shapes", action="store_true")
-    return parser.parse_args()
+    parser.add_argument("--debug-shapes", "--debug_shapes", dest="debug_shapes", action="store_true")
+    args = parser.parse_args()
+    if args.ddim_steps <= 0:
+        parser.error("--ddim_steps / --num-sampling-steps must be positive.")
+    if args.num_samples <= 0:
+        parser.error("--num_samples must be positive.")
+    if args.prediction_index < 1:
+        parser.error("--prediction_index must be >= 1. It matches generated files testX-1.png ... testX-num_samples.png.")
+    if args.prediction_index > args.num_samples:
+        parser.error("--prediction_index must be <= --num_samples.")
+    return args
 
 
 def capture_steps(total_steps):
@@ -158,11 +171,13 @@ def torch_clamp_image(tensor_chw):
 
 
 def decode_frame(model, latent_batch_cpu, prediction_index, device):
-    if prediction_index < 0 or prediction_index >= latent_batch_cpu.shape[0]:
+    batch_index = prediction_index - 1
+    if batch_index < 0 or batch_index >= latent_batch_cpu.shape[0]:
         raise IndexError(
-            f"prediction-index {prediction_index} is out of range for batch size {latent_batch_cpu.shape[0]}."
+            f"prediction-index {prediction_index} is out of range. "
+            f"Use 1..{latent_batch_cpu.shape[0]} to match testX-1.png ... testX-{latent_batch_cpu.shape[0]}.png."
         )
-    latent = latent_batch_cpu[prediction_index:prediction_index + 1].to(device)
+    latent = latent_batch_cpu[batch_index:batch_index + 1].to(device)
     decoded = model.decode_first_stage(latent)
     return to_uint8_image(decoded[0].detach().cpu())
 
@@ -200,15 +215,17 @@ def write_metadata(path, args, routing_state, config, captures, paths, files, fi
     metadata = {
         "sample_index": args.sample_index,
         "prediction_index": args.prediction_index,
+        "prediction_batch_index_zero_based": args.prediction_index - 1,
+        "matches_run_fixed_chunking_filename": f"test{args.sample_index}-{args.prediction_index}.png",
         "routing_mode": args.routing_mode,
         "total_sampling_steps": config.ddim_steps,
         "capture_steps": captures,
         "chunk_boundaries": routing_state.bounds,
         "chunk_lengths": [end - start for start, end in routing_state.bounds] if routing_state.bounds else None,
-        "stage1_weights": stage_weights("forward", 0.1),
-        "stage2_weights": stage_weights("forward", 0.5),
-        "stage3_weights": stage_weights("forward", 0.9),
-        "stage_weights": routing_weight_summary("forward"),
+        "stage1_weights": stage_weights(args.routing_mode, 0.1),
+        "stage2_weights": stage_weights(args.routing_mode, 0.5),
+        "stage3_weights": stage_weights(args.routing_mode, 0.9),
+        "stage_weights": routing_weight_summary(args.routing_mode),
         "config": paths["config_path"],
         "checkpoint": paths["checkpoint_path"],
         "seed": args.seed,
@@ -226,7 +243,7 @@ def write_metadata(path, args, routing_state, config, captures, paths, files, fi
             "Frames are decoded from latents captured during one real PLMS sampling run. "
             "Frame 0 decodes the initial x_T noise latent; the intermediate frames decode the current latent "
             "after the first and second thirds of denoising. The routing implementation is imported from "
-            "code/run_fixed_chunking.py and uses forward routing on post-projector U-Net context tokens. "
+            "code/run_fixed_chunking.py and uses fixed routing on post-projector U-Net context tokens. "
             "By default, the script advances the RNG by sample_index initial-noise batches so sample N matches "
             "the normal run_fixed_chunking.py dataset order."
         ),
@@ -235,23 +252,23 @@ def write_metadata(path, args, routing_state, config, captures, paths, files, fi
 
 
 def main():
+    args = parse_args()
     import torch
     from einops import repeat
 
-    args = parse_args()
     root = args.root.resolve()
 
-    routing_state = RoutingState("forward", args.eps)
+    routing_state = RoutingState(args.routing_mode, args.eps)
     model_wrap, dataset_test, config, state, paths = build_model_and_data(args, routing_state)
     config.num_samples = args.num_samples
-    config.ddim_steps = args.num_sampling_steps
+    config.ddim_steps = args.ddim_steps
 
     if args.sample_index < 0 or args.sample_index >= len(dataset_test):
         raise IndexError(f"sample-index {args.sample_index} is out of range for dataset length {len(dataset_test)}.")
 
     timestamp = datetime.datetime.now().strftime("%d-%m-%Y-%H-%M-%S")
     output_root = resolve_path(root, args.output_dir)
-    output_dir = output_root / f"sample{args.sample_index}_seed{args.seed}_{timestamp}"
+    output_dir = output_root / args.routing_mode / f"sample{args.sample_index}_pred{args.prediction_index}_seed{args.seed}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=False)
 
     device = model_wrap.device
@@ -325,7 +342,7 @@ def main():
 
     print(f"chunk boundaries: {routing_state.bounds}", flush=True)
     print(f"chunk lengths: {[end - start for start, end in routing_state.bounds]}", flush=True)
-    print(f"stage weights: {routing_weight_summary('forward')}", flush=True)
+    print(f"stage weights: {routing_weight_summary(args.routing_mode)}", flush=True)
     print(f"final latent max abs diff vs sampler return: {final_diff:.8g}", flush=True)
     print("saved files:", flush=True)
     for file in saved_files:
