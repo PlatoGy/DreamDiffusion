@@ -412,6 +412,22 @@ def configure_trainable(model, scope):
     return trainable
 
 
+def disable_gradient_checkpointing(model):
+    disabled = {"checkpoint": 0, "use_checkpoint": 0}
+    for module in model.modules():
+        if hasattr(module, "checkpoint") and getattr(module, "checkpoint"):
+            module.checkpoint = False
+            disabled["checkpoint"] += 1
+        if hasattr(module, "use_checkpoint") and getattr(module, "use_checkpoint"):
+            module.use_checkpoint = False
+            disabled["use_checkpoint"] += 1
+    print(
+        "disabled gradient checkpointing for partial-parameter training: "
+        f"checkpoint={disabled['checkpoint']} use_checkpoint={disabled['use_checkpoint']}",
+        flush=True,
+    )
+
+
 def grad_norm_for(model, predicate):
     total = 0.0
     found = False
@@ -575,6 +591,7 @@ def build_model_and_data(args):
     original_p_losses = patch_p_losses(model, method_state)
     patched_attn = patch_attn2_modules(model, method_state)
     trainable = configure_trainable(model, args.train_scope)
+    disable_gradient_checkpointing(model)
     optimizer = torch.optim.AdamW([p for _, p in trainable], lr=args.lr)
     if "optimizer_state_dict" in payload and "dynamic_chunking_method" in payload:
         optimizer.load_state_dict(payload["optimizer_state_dict"])
