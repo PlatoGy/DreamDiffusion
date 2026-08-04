@@ -120,11 +120,6 @@ class MethodState:
     def start_batch(self, t, num_timesteps):
         self.current_t = t.detach()
         self.num_timesteps = int(num_timesteps)
-        self.h_tokens = None
-        self.context = None
-        self.lengths = None
-        self.boundaries = None
-        self.membership = None
         self.weights = None
         self.pi = None
 
