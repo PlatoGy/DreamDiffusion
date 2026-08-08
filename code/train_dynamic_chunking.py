@@ -495,7 +495,7 @@ def main():
     from torch.utils.data import DataLoader
 
     from dataset import create_EEG_dataset
-    from dc_ldm.ldm_for_eeg import eLDM_eval
+    from dc_ldm.ldm_for_eeg_chunking import eLDM_eval
 
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():

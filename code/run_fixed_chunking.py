@@ -539,7 +539,7 @@ def build_model_and_data(args, routing_state):
     from einops import rearrange
 
     from dataset import create_EEG_dataset
-    from dc_ldm.ldm_for_eeg import eLDM_eval
+    from dc_ldm.ldm_for_eeg_chunking import eLDM_eval
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)

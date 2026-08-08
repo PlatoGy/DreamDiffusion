@@ -45,10 +45,7 @@ class cond_stage_model(nn.Module):
         self.fmri_seq_len = model.num_patches
         self.fmri_latent_dim = model.embed_dim
         if global_pool == False:
-            self.channel_mapper = nn.Sequential(
-                nn.Conv1d(self.fmri_seq_len, self.fmri_seq_len // 2, 1, bias=True),
-                nn.Conv1d(self.fmri_seq_len // 2, 77, 1, bias=True)
-            )
+            self.channel_mapper = nn.AdaptiveAvgPool1d(77)
         self.dim_mapper = nn.Linear(self.fmri_latent_dim, cond_dim, bias=True)
         self.global_pool = global_pool
 
@@ -68,7 +65,9 @@ class cond_stage_model(nn.Module):
         latent_crossattn = self.mae(x)
         latent_return = latent_crossattn
         if self.global_pool == False:
+            latent_crossattn = latent_crossattn.transpose(1, 2)
             latent_crossattn = self.channel_mapper(latent_crossattn)
+            latent_crossattn = latent_crossattn.transpose(1, 2).contiguous()
         latent_crossattn = self.dim_mapper(latent_crossattn)
         out = latent_crossattn
         return out, latent_return
